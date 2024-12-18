@@ -1,0 +1,433 @@
+import sqlite3
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import os
+import random
+import re
+import difflib
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, InvalidElementStateException
+from openpyxl import load_workbook
+from urllib.parse import urlparse
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    InvalidElementStateException,
+    StaleElementReferenceException
+)
+
+# --- SQLite Bağlantısı ve Tablo Oluşturma ---
+def create_connection():
+    conn = sqlite3.connect('data_mining.db')
+    return conn
+    
+
+def create_table(conn):
+    with conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS company_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_name TEXT UNIQUE,
+                website TEXT,
+                email TEXT,
+                phone TEXT,
+                status TEXT
+            )
+        ''')
+#her şirkette update et, yani şirketi veri tabanına kaydet.
+def insert_or_update_data(conn, company_name, website, email, phone, status):
+    try:
+        with conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO company_data (company_name, website, email, phone, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (company_name, website, email, phone, status))
+        log_message(f"Veri tabanına kaydedildi: {company_name}, {website}")
+    except Exception as e:
+        log_message(f"Veri tabanına eklerken hata oluştu: {e}")
+
+def fetch_all_data(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM company_data")
+    rows = cur.fetchall()
+    return rows
+
+#checkpoint tablosu yaratarak şu ana kadar kaydedilmiş verileri kontrol edelim.
+def create_checkpoint_table(conn):
+    with conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS checkpoint (
+                batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_company_name TEXT,
+                status TEXT
+            )
+        ''')
+
+
+# --- Tarayıcı başlatma seçenekleri ---
+chrome_options = Options()
+chrome_options.add_argument('--disable-gpu')
+chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+chrome_options.add_argument('--disable-software-rasterizer')
+chrome_options.add_argument('--disable-extensions')
+chrome_options.add_argument('--ignore-certificate-errors')
+chrome_options.add_argument('--allow-running-insecure-content')
+chrome_options.add_argument('--disable-webgl')
+chrome_options.add_argument('--use-gl=swiftshader')
+chrome_options.add_argument('--enable-unsafe-swiftshader')
+chrome_options.add_argument('--disable-accelerated-2d-canvas')
+chrome_options.add_argument('--log-level=3')
+chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+
+# Rastgele User-Agent ayarlama
+user_agents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+]
+random_user_agent = random.choice(user_agents)
+chrome_options.add_argument(f'user-agent={random_user_agent}')
+
+# Log mesajları için fonksiyon
+def log_message(message):
+    print(message)
+    with open("log.txt", "a", encoding="utf-8") as log_file:
+        log_file.write(message + "\n")
+        log_file.flush()
+
+# Yeni fonksiyon: Domain ve şirket ismi benzerliği kontrolü
+def best_match_website(websites, company_name):
+    if not websites:
+        return "Bulunamadı"
+    
+    best_score = 0
+    best_website = websites[0]
+    
+    # Şirket isminin normalize edilmiş halini al
+    company_name_clean = company_name.strip().lower()
+    
+    for website in websites:
+        website_name = urlparse(website).netloc.replace('www.', '')
+        score = difflib.SequenceMatcher(None, company_name_clean, website_name).ratio()
+        
+        if score > best_score:
+            best_score = score
+            best_website = website
+            
+    return best_website if best_score > 0.4 else "Bulunamadı"  # Skor eşiğini belirle
+
+#URL araması yapmak için olan fonksiyon
+def google_search_and_extract_info(driver, company_name, retries=5):
+    search_url = "https://www.google.com"
+    wait = WebDriverWait(driver, 20)
+
+    # Arama sorguları listesini genişletiyoruz
+    search_queries = [
+        f"{company_name} official website",
+        f"{company_name} website",
+        f"{company_name} contact page",
+        f"{company_name} company site",
+        f"{company_name} homepage",
+        f"{company_name} about us",
+        f"{company_name} contact us",
+        f"{company_name} site:.com",
+        f"{company_name} company headquarters",
+        f"{company_name} official site",
+        f"{company_name} kontakt",
+        f"{company_name} home",
+    ]
+
+    for attempt in range(retries):
+        try:
+            # Google ana sayfasına git
+            driver.get(search_url)
+            time.sleep(random.uniform(2, 4))
+
+            # Her sorgu için ayrı bir arama yap
+            for query in search_queries:
+                try:
+                    # Arama kutusunu bul ve arama yap
+                    search_box = wait.until(EC.presence_of_element_located((By.NAME, "q")))
+                    search_box.clear()
+                    search_box.send_keys(query)
+                    search_box.send_keys(Keys.RETURN)
+                    time.sleep(random.uniform(2, 4))
+
+                    # Arama sonuçlarını alalım
+                    page_links = wait.until(EC.presence_of_all_elements_located((By.XPATH, '//a/h3')))
+                    urls = [link.find_element(By.XPATH, '..').get_attribute('href') for link in page_links]
+
+                    # Eğer sonuçlar arasında doğru website bulunursa
+                    best_match = best_match_website(urls, company_name)
+                    if best_match != "Bulunamadı":
+                        return best_match
+
+                    # Sonuçlar arasında doğru website bulunamazsa geri dön
+                    driver.back()
+                    time.sleep(random.uniform(2, 4))
+
+                except (TimeoutException, NoSuchElementException, StaleElementReferenceException) as e:
+                    log_message(f"{company_name} için sorgu hatası: {e}")
+                    driver.back()  # Hata alırsak bir önceki sayfaya geri dönelim
+                    time.sleep(random.uniform(2, 4))
+
+        except (TimeoutException, InvalidElementStateException) as e:
+            log_message(f"{company_name} için genel arama hatası: {e}")
+            if attempt == retries - 1:  # Son denemede başarısız olursa
+                log_message(f"{company_name} için geçerli bir URL bulunamadı.")
+                return None
+            time.sleep(random.uniform(5, 10))  # Retry için bekleme süresi
+
+    return None
+
+# --- Regex Desenleri ---
+
+EMAIL_REGEX = r'[A-Za-z0-9._%+-]+(?:\[[A-Za-z0-9._%+-]+\])?@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+PHONE_REGEX = r'''
+    (?:(?:\+|00)\d{1,3}[\s-]?)?                # Uluslararası kod (+90, 0044 vb.)
+    (?:\(?\d{1,4}\)?[\s-]?)?                   # Şehir veya operatör kodu (0 (212), 044 vb.)
+    (?:\d{1,4}[\s-]?)?                         # Orta blok (555 vb.)
+    (?:\d{1,4}[\s-]?)                          # İkinci blok (123 vb.)
+    (?:\d{1,9})                                # Son blok (4567 veya 4567890 vb.)
+    (?!\s*(?:\d{4}|\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{4})) # Tarih (örn: 2024 veya 15.11.2024)
+    (?!\s*\d{5}(?:[-\s]?\d{4})?)                # Posta kodu (örn: 12345 veya 12345-6789)
+    (?!\s*(?:no|street|road|avenue|blvd|lane|drive|sokak|cadde)\s*\d+)
+    (?!\s*\d+(?:[\.,]\d{1,2})?\s?(?:USD|EUR|TRY|TL|£|\$|€)) # Fiyat bilgisi
+    (?!\s*\d{1,3}\s*(?:y|yrs|yr|experience|experience\sof\s)\s*)    # 'y', 'yrs', 'yr', 'experience' gibi kısa ifadelerle gelen sayıları dışla
+    (?!\s*(\d{4}|\d{2}[\/\.-]\d{1,2}[\/\.-]\d{4}))  # Yıl ve tarih formatlarını dışla
+    (?=.*(?:phone|p|tel|telephone|call)?)     # Anahtar kelime varsa öncelikli eşleş
+    (?!\s*(?:1111|1234|999999999999999|[0]{5,}))  # Şüpheli ardışık veya yüksek sayılar
+    (?!\s*\d{1,2})  # 1 veya 2 haneli sayıları dışla
+   
+    
+'''
+#burda best match mail fonksiyonu ile mail domain benzerliğine bakıyoruz.
+def best_match_email(emails, domain):
+    if not emails:
+        return "Bulunamadı"
+    
+    best_score = 0
+    best_email = emails[0]
+    
+    # Temizleme: email adresindeki gereksiz boşlukları ve özel karakterleri temizleyelim
+    emails = [email.strip().lower() for email in emails if '@' in email]
+    
+    keywords = ['info', 'contact', 'support', 'admin']
+    
+    for email in emails:
+        email_domain = email.split('@')[-1]
+        
+        # Domain benzerliği ölçümü
+        score = difflib.SequenceMatcher(None, email_domain, domain).ratio()
+        
+        # Anahtar kelimeleri de dikkate alalım
+        for keyword in keywords:
+            if keyword in email:
+                score += 0.2  # Anahtar kelimeleri bulduğunda skoru artır
+        
+        if score > best_score:
+            best_score = score
+            best_email = email
+            
+    return best_email if best_score > 0.5 else "Bulunamadı"
+
+#bu fonksiyon sitede belli kısımlara erişiyor.
+def find_contact_page(driver, base_url):
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    links = soup.find_all('a', href=True)
+    
+    contact_keywords = ['contact', 'about', 'info']
+    for link in links:
+        href = link['href'].lower()
+        if any(keyword in href for keyword in contact_keywords):
+            if not href.startswith('http'):
+                href = f"{base_url.rstrip('/')}/{href.lstrip('/')}"
+            log_message(f"Contact page found for {base_url}: {href}")
+            return href
+    return None
+
+
+def extract_emails_from_contact_page(driver, contact_page_url):
+    """Belirli bir iletişim sayfasından e-posta adreslerini ayıklar."""
+    contact_emails = []
+    try:
+        # İletişim sayfasına git
+        driver.get(contact_page_url)
+        
+        # Sayfanın tamamen yüklenmesini bekle
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        # Sayfa içeriğini BeautifulSoup ile analiz et
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        text = soup.get_text().lower()
+
+        # E-posta adreslerini çıkar
+        raw_emails = list(set(re.findall(EMAIL_REGEX, text)))
+        
+        if raw_emails:
+            contact_emails = raw_emails
+        
+    except Exception as e:
+        log_message(f"Error extracting emails from {contact_page_url}: {e}")
+    
+    return contact_emails
+
+
+# --- İletişim Bilgilerini Çıkaran Fonksiyon ---
+def extract_contact_info(driver, url):
+    """Bir URL'den e-posta ve telefon numaralarını ayıklar."""
+    contact_info = {"emails": [], "phones": []}
+    
+    try:
+        driver.get(url)
+
+        # WebDriverWait kullanarak sayfanın tamamen yüklenmesini bekleyin
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        # Sayfa içeriğini BeautifulSoup ile analiz et
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        text = soup.get_text().lower()
+
+        # Telefon numarasını `tel:` linki ile kontrol et
+        phone_tag = soup.find('a', href=re.compile('tel:'))
+        if phone_tag:
+            contact_info['phones'].append(phone_tag['href'].replace('tel:', ''))
+
+        # E-posta adreslerini çıkar
+        raw_emails = list(set(re.findall(EMAIL_REGEX, text)))
+        all_numbers = re.findall(PHONE_REGEX, text, re.VERBOSE)
+
+        # Telefon numaralarını filtrele: 'fax' anahtar kelimelerini hariç tut
+        for number in all_numbers:
+            if number:  # Eğer number boş değilse
+                surrounding_text = text.split(number)[0][-50:]  # Numaradan önceki metni al
+                if "fax" not in surrounding_text and "faks" not in surrounding_text:
+                    contact_info['phones'].append(number)
+
+        # E-posta adreslerinden "best match" olanı seç
+        if raw_emails:
+            best_email = best_match_email(raw_emails, url)
+            contact_info['emails'] = [best_email] if best_email != "Bulunamadı" else []
+
+        # Alt sayfalar için iletişim sayfalarını arama
+        links = soup.find_all('a', href=True)
+        for link in links:
+            href = link['href'].lower()
+            if any(keyword in href for keyword in ['contact', 'about', 'info']):
+                # Mutlak URL oluştur
+                if not href.startswith('http'):
+                    href = f"{url.rstrip('/')}/{href.lstrip('/')}"
+                
+                # İletişim sayfasında e-posta adreslerini çıkar
+                contact_page_emails = extract_emails_from_contact_page(driver, href)
+                if contact_page_emails:
+                    contact_info['emails'].extend(contact_page_emails)
+
+        # Benzersiz sonuçları döndür
+        contact_info['emails'] = list(set(contact_info['emails']))
+        contact_info['phones'] = list(set(contact_info['phones']))
+
+    except Exception as e:
+        log_message(f"Error extracting contact info from {url}: {e}")
+
+    return contact_info
+
+# --- SQLite Kurulum ---
+conn = create_connection()
+create_table(conn)
+create_checkpoint_table(conn)
+
+# Şirket isimlerinin bulunduğu Excel dosyası
+base_dir = os.getcwd()
+excel_file = os.path.join(base_dir, ".vscode", "DataMiningProject.xlsx")
+
+#okuduğu excel dosyasını kontrol ediyor.
+if os.path.exists(excel_file):
+    df = pd.read_excel(excel_file)
+    company_names = df["Company Name"].tolist()
+else:
+    log_message(f"{excel_file} dosyası bulunamadı.")
+    exit()
+
+def batch_generator(lst, batch_size):
+    for i in range(0, len(lst), batch_size):
+        yield lst[i:i + batch_size]
+
+
+#checkpoint tablosunda statüyü ve kaydedilip kaydedilmediğini kontrol ediyor.
+def update_checkpoint(conn, last_company_name, status="completed"):
+    with conn:
+        conn.execute('''
+            INSERT INTO checkpoint (last_company_name, status)
+            VALUES (?, ?)
+        ''', (last_company_name, status))
+
+def get_last_checkpoint(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT last_company_name FROM checkpoint ORDER BY batch_id DESC LIMIT 1")
+    result = cur.fetchone()
+    return result[0] if result else None
+
+
+# --- Batch işlemleri ---
+batch_size = 5
+conn = create_connection()
+last_processed_company = get_last_checkpoint(conn)
+start_index = company_names.index(last_processed_company) + 1 if last_processed_company else 0
+
+for idx, company_batch in enumerate(batch_generator(company_names[start_index:], batch_size), start=1):
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(30)
+    
+    log_message(f"Batch {idx} üzerinde çalışılıyor...")
+
+    for company in company_batch:
+        try:
+            # Şirketin web sitesini Google'dan al
+            contact_link = google_search_and_extract_info(driver, company)
+
+            if contact_link:
+                # Web sitesinden iletişim bilgilerini çıkar
+                contact_info = extract_contact_info(driver, contact_link)
+                emails = ", ".join(contact_info['emails']) if contact_info['emails'] else "Bulunamadı"
+                phones = ", ".join(["".join(phone) for phone in contact_info['phones']]) if contact_info['phones'] else "Bulunamadı"
+
+                # Veritabanına kaydet
+                insert_or_update_data(conn, company, contact_link, emails, phones, "Başarılı")
+            else:
+                insert_or_update_data(conn, company, None, None, None, "Başarısız")
+
+            # Checkpoint güncelle
+            update_checkpoint(conn, company)
+
+        except Exception as e:
+            log_message(f"{company} için bir hata oluştu: {e}")
+            insert_or_update_data(conn, company, None, None, None, "Başarısız")
+    
+    # Tarayıcıyı kapat
+    driver.quit()
+
+# Veritabanını kapat
+conn.close()
+
+log_message("Tüm batchler işlendi ve tamamlandı.")
+
+
+# Veri tabanını kontrol etmek için
+data = fetch_all_data(conn)
+log_message(f"Veri tabanında {len(data)} kayıt var.")
+
+# Veritabanı bağlantısını kapat
+conn.close()
